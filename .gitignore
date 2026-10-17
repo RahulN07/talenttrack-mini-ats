@@ -24,3 +24,11 @@ htmlcov/
 # Local database backups
 *.dump
 *.sql.gz
+
+
+# Frontend dependencies and build output
+node_modules/
+dist/
+
+# Python environment files
+*.pyc

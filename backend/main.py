@@ -1,6 +1,7 @@
 
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
@@ -8,49 +9,32 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import EmailStr
+from sqlalchemy import func
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
 
-# -----------------------------
-# Database configuration
-# -----------------------------
+# --------------------------------------------------
+# 1. Load environment variables
+# --------------------------------------------------
 
-# Load .env from the same directory as this file.
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
     raise RuntimeError(
-        "DATABASE_URL is missing. Add it to your backend/.env file."
+        "DATABASE_URL is missing. Check your backend/.env file."
     )
-
-# Keep SQLite support if you ever choose to use it again.
-connect_args = (
-    {"check_same_thread": False}
-    if DATABASE_URL.startswith("sqlite")
-    else {}
-)
 
 engine = create_engine(
     DATABASE_URL,
-    connect_args=connect_args,
     pool_pre_ping=True,
 )
 
 
-def create_db_and_tables():
-    SQLModel.metadata.create_all(engine)
-
-
-def get_session():
-    with Session(engine) as session:
-        yield session
-
-
-# -----------------------------
-# Hiring stages
-# -----------------------------
+# --------------------------------------------------
+# 2. Hiring stage choices
+# --------------------------------------------------
 
 class HiringStage(str, Enum):
     APPLIED = "Applied"
@@ -61,13 +45,13 @@ class HiringStage(str, Enum):
     REJECTED = "Rejected"
 
 
-# -----------------------------
-# Database and API models
-# -----------------------------
+# --------------------------------------------------
+# 3. Candidate schemas and database model
+# --------------------------------------------------
 
 class CandidateBase(SQLModel):
     name: str = Field(min_length=1, max_length=100)
-    email: str = Field(index=True, max_length=254)
+    email: EmailStr = Field(index=True, max_length=254)
     role: str = Field(min_length=1, max_length=100)
     stage: HiringStage = Field(default=HiringStage.APPLIED)
 
@@ -75,31 +59,62 @@ class CandidateBase(SQLModel):
 class Candidate(CandidateBase, table=True):
     id: int | None = Field(default=None, primary_key=True)
 
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        nullable=False,
+        sa_column_kwargs={
+            "onupdate": lambda: datetime.now(timezone.utc)
+        },
+    )
+
 
 class CandidateCreate(CandidateBase):
-    email: EmailStr
+    pass
 
 
-class CandidateUpdate(CandidateBase):
-    email: EmailStr
+class CandidateUpdate(SQLModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    email: EmailStr | None = None
+    role: str | None = Field(default=None, min_length=1, max_length=100)
+    stage: HiringStage | None = None
 
 
-# -----------------------------
-# FastAPI application
-# -----------------------------
+# --------------------------------------------------
+# 4. Database session
+# --------------------------------------------------
+
+def get_session():
+    with Session(engine) as session:
+        yield session
+
+
+# --------------------------------------------------
+# 5. Application startup
+# --------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    create_db_and_tables()
+    # Alembic manages database schema changes.
+    # Apply migrations before starting the application.
     yield
 
 
 app = FastAPI(
-    title="Mini ATS API",
-    description="Applicant Tracking System for managing candidates",
-    version="1.1.0",
+    title="TalentTrack Mini ATS",
+    description="A simple Applicant Tracking System API",
+    version="1.0.0",
     lifespan=lifespan,
 )
+
+
+# --------------------------------------------------
+# 6. CORS configuration
+# --------------------------------------------------
 
 app.add_middleware(
     CORSMiddleware,
@@ -113,41 +128,54 @@ app.add_middleware(
 )
 
 
-# -----------------------------
-# Basic endpoints
-# -----------------------------
+# --------------------------------------------------
+# 7. Health check
+# --------------------------------------------------
 
 @app.get("/")
-def home():
-    return {"message": "Welcome to Mini ATS API"}
+def read_root():
+    return {
+        "message": "Welcome to TalentTrack Mini ATS API",
+        "docs": "/docs",
+    }
 
 
 @app.get("/health")
-def health():
-    return {"status": "healthy"}
+def health_check(session: Session = Depends(get_session)):
+    try:
+        session.exec(select(1)).first()
+        return {
+            "status": "healthy",
+            "database": "connected",
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Database connection failed",
+        ) from exc
 
 
-# -----------------------------
-# List, search and filter
-# -----------------------------
+# --------------------------------------------------
+# 8. List, search, and filter candidates
+# --------------------------------------------------
 
 @app.get("/candidates", response_model=list[Candidate])
 def get_candidates(
-    search: str = Query(default=""),
-    stage: HiringStage | None = None,
+    search: str | None = Query(default=None),
+    stage: HiringStage | None = Query(default=None),
     session: Session = Depends(get_session),
 ):
     statement = select(Candidate)
 
-    if search.strip():
-        term = f"%{search.strip()}%"
+    if search:
+        search_term = f"%{search.strip()}%"
         statement = statement.where(
-            Candidate.name.ilike(term)
-            | Candidate.email.ilike(term)
-            | Candidate.role.ilike(term)
+            Candidate.name.ilike(search_term)
+            | Candidate.email.ilike(search_term)
+            | Candidate.role.ilike(search_term)
         )
 
-    if stage is not None:
+    if stage:
         statement = statement.where(Candidate.stage == stage)
 
     statement = statement.order_by(Candidate.id.desc())
@@ -155,36 +183,34 @@ def get_candidates(
     return session.exec(statement).all()
 
 
-# -----------------------------
-# Create candidate
-# -----------------------------
+# --------------------------------------------------
+# 9. Create a candidate
+# --------------------------------------------------
 
-@app.post(
-    "/candidates",
-    response_model=Candidate,
-    status_code=201,
-)
+@app.post("/candidates", response_model=Candidate, status_code=201)
 def create_candidate(
-    data: CandidateCreate,
+    candidate_data: CandidateCreate,
     session: Session = Depends(get_session),
 ):
-    email = str(data.email).strip().lower()
+    email = str(candidate_data.email).lower()
 
-    existing = session.exec(
+    existing_candidate = session.exec(
         select(Candidate).where(Candidate.email == email)
     ).first()
 
-    if existing:
+    if existing_candidate:
         raise HTTPException(
             status_code=409,
-            detail="A candidate with this email already exists.",
+            detail="A candidate with this email already exists",
         )
 
-    candidate = Candidate(
-        name=data.name.strip(),
-        email=email,
-        role=data.role.strip(),
-        stage=data.stage,
+    candidate = Candidate.model_validate(
+        candidate_data,
+        update={
+            "email": email,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+        },
     )
 
     session.add(candidate)
@@ -194,9 +220,9 @@ def create_candidate(
     return candidate
 
 
-# -----------------------------
-# Get one candidate
-# -----------------------------
+# --------------------------------------------------
+# 10. Get one candidate
+# --------------------------------------------------
 
 @app.get("/candidates/{candidate_id}", response_model=Candidate)
 def get_candidate(
@@ -208,20 +234,20 @@ def get_candidate(
     if candidate is None:
         raise HTTPException(
             status_code=404,
-            detail="Candidate not found.",
+            detail="Candidate not found",
         )
 
     return candidate
 
 
-# -----------------------------
-# Update candidate
-# -----------------------------
+# --------------------------------------------------
+# 11. Update a candidate
+# --------------------------------------------------
 
 @app.put("/candidates/{candidate_id}", response_model=Candidate)
 def update_candidate(
     candidate_id: int,
-    data: CandidateUpdate,
+    candidate_data: CandidateUpdate,
     session: Session = Depends(get_session),
 ):
     candidate = session.get(Candidate, candidate_id)
@@ -229,25 +255,31 @@ def update_candidate(
     if candidate is None:
         raise HTTPException(
             status_code=404,
-            detail="Candidate not found.",
+            detail="Candidate not found",
         )
 
-    email = str(data.email).strip().lower()
+    update_data = candidate_data.model_dump(exclude_unset=True)
 
-    existing = session.exec(
-        select(Candidate).where(Candidate.email == email)
-    ).first()
+    if "email" in update_data and update_data["email"] is not None:
+        update_data["email"] = str(update_data["email"]).lower()
 
-    if existing is not None and existing.id != candidate_id:
-        raise HTTPException(
-            status_code=409,
-            detail="That email belongs to another candidate.",
-        )
+        duplicate = session.exec(
+            select(Candidate).where(
+                Candidate.email == update_data["email"],
+                Candidate.id != candidate_id,
+            )
+        ).first()
 
-    candidate.name = data.name.strip()
-    candidate.email = email
-    candidate.role = data.role.strip()
-    candidate.stage = data.stage
+        if duplicate:
+            raise HTTPException(
+                status_code=409,
+                detail="Another candidate already uses this email",
+            )
+
+    for field, value in update_data.items():
+        setattr(candidate, field, value)
+
+    candidate.updated_at = datetime.now(timezone.utc)
 
     session.add(candidate)
     session.commit()
@@ -256,9 +288,9 @@ def update_candidate(
     return candidate
 
 
-# -----------------------------
-# Delete candidate
-# -----------------------------
+# --------------------------------------------------
+# 12. Delete a candidate
+# --------------------------------------------------
 
 @app.delete("/candidates/{candidate_id}")
 def delete_candidate(
@@ -270,32 +302,40 @@ def delete_candidate(
     if candidate is None:
         raise HTTPException(
             status_code=404,
-            detail="Candidate not found.",
+            detail="Candidate not found",
         )
 
     session.delete(candidate)
     session.commit()
 
-    return {"message": "Candidate deleted successfully."}
-
-
-# -----------------------------
-# Dashboard statistics
-# -----------------------------
-
-@app.get("/dashboard")
-def dashboard(session: Session = Depends(get_session)):
-    all_candidates = session.exec(select(Candidate)).all()
-
-    stage_counts = {
-        stage.value: sum(
-            1 for candidate in all_candidates
-            if candidate.stage == stage
-        )
-        for stage in HiringStage
+    return {
+        "message": "Candidate deleted successfully",
+        "candidate_id": candidate_id,
     }
 
+
+# --------------------------------------------------
+# 13. Dashboard statistics
+# --------------------------------------------------
+
+@app.get("/dashboard")
+def get_dashboard(session: Session = Depends(get_session)):
+    total_candidates = session.exec(
+        select(func.count()).select_from(Candidate)
+    ).one()
+
+    stage_counts = {}
+
+    for hiring_stage in HiringStage:
+        count = session.exec(
+            select(func.count())
+            .select_from(Candidate)
+            .where(Candidate.stage == hiring_stage)
+        ).one()
+
+        stage_counts[hiring_stage.value] = count
+
     return {
-        "total_candidates": len(all_candidates),
+        "total_candidates": total_candidates,
         "stage_counts": stage_counts,
     }
